@@ -297,7 +297,7 @@ impl<T> Channel<T> {
     }
 
     /// Attempts to reserve a slot for receiving a message.
-    fn start_recv(&self, token: &mut Token) -> bool {
+    fn start_recv(&self, token: &mut Token, can_block: bool) -> bool {
         let backoff = Backoff::new();
         let mut head = self.head.index.load(Ordering::Acquire);
         let mut block = self.head.block.load(Ordering::Acquire);
@@ -308,6 +308,9 @@ impl<T> Channel<T> {
 
             // If we reached the end of the block, wait until the next one is installed.
             if offset == BLOCK_CAP {
+                if !can_block {
+                    return false;
+                }
                 backoff.snooze();
                 head = self.head.index.load(Ordering::Acquire);
                 block = self.head.block.load(Ordering::Acquire);
@@ -342,10 +345,25 @@ impl<T> Channel<T> {
             // The block can be null here only if the first message is being sent into the channel.
             // In that case, just wait until it gets initialized.
             if block.is_null() {
+                if !can_block {
+                    return false;
+                }
                 backoff.snooze();
                 head = self.head.index.load(Ordering::Acquire);
                 block = self.head.block.load(Ordering::Acquire);
                 continue;
+            }
+
+            if !can_block {
+                // If the caller is not allowed to block (e.g. try_recv) and
+                // the write isn't ready yet, do not return a token for this
+                // slot yet. If the caller can block, we will return the token
+                // and the caller (e.g. recv) will block waiting for the sender
+                // to write.
+                let slot = unsafe { (*block).slots.get_unchecked(offset) };
+                if slot.state.load(Ordering::Acquire) & WRITE == 0 {
+                    return false;
+                }
             }
 
             // Try moving the head index forward.
@@ -358,6 +376,9 @@ impl<T> Channel<T> {
                 Ok(_) => unsafe {
                     // If we've reached the end of the block, move to the next one.
                     if offset + 1 == BLOCK_CAP {
+                        // This wait will not block if !can_block because we
+                        // checked that the slot was written to above and that
+                        // only happens after the next block has installed.
                         let next = (*block).wait_next();
                         let mut next_index = (new_head & !MARK_BIT).wrapping_add(1 << SHIFT);
                         if !(*next).next.load(Ordering::Relaxed).is_null() {
@@ -432,7 +453,7 @@ impl<T> Channel<T> {
     pub(crate) fn try_recv(&self) -> Result<T, TryRecvError> {
         let token = &mut Token::default();
 
-        if self.start_recv(token) {
+        if self.start_recv(token, false) {
             unsafe { self.read(token).map_err(|_| TryRecvError::Disconnected) }
         } else {
             Err(TryRecvError::Empty)
@@ -446,7 +467,7 @@ impl<T> Channel<T> {
             // Try receiving a message several times.
             let backoff = Backoff::new();
             loop {
-                if self.start_recv(token) {
+                if self.start_recv(token, true) {
                     unsafe {
                         return self.read(token).map_err(|_| RecvTimeoutError::Disconnected);
                     }
@@ -691,7 +712,7 @@ pub(crate) struct Sender<'a, T>(&'a Channel<T>);
 
 impl<T> SelectHandle for Receiver<'_, T> {
     fn try_select(&self, token: &mut Token) -> bool {
-        self.0.start_recv(token)
+        self.0.start_recv(token, true)
     }
 
     fn deadline(&self) -> Option<Instant> {
